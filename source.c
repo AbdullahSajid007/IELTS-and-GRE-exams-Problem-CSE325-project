@@ -1,3 +1,21 @@
+/*
+ * Mock IELTS & GRE Exam Manager
+ * --------------------------------
+ * This program simulates the management of students entering exam rooms, 
+ * taking an exam, and leaving after it ends. 
+ *
+ * Features:
+ *  - Uses fork() and pipe() for inter-process communication (IPC).
+ *  - Uses pthreads for simulating multiple students concurrently.
+ *  - Synchronization is handled with semaphores, mutexes, and condition variables.
+ *
+ * Scenario:
+ *  - NUM_STUDENTS students need to attend an exam.
+ *  - Students are distributed across NUM_ROOMS with ROOM_CAPACITY seats each.
+ *  - All students must enter before the exam starts.
+ *  - When the exam ends (signaled by condition variable), all students leave.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -6,141 +24,182 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
-#define NUM_STUDENTS   300
-#define ROOM_CAPACITY  30
-#define NUM_ROOMS ((NUM_STUDENTS + ROOM_CAPACITY - 1) / ROOM_CAPACITY)
+/* ------------ Configurable parameters ------------ */
+#define NUM_STUDENTS   300         // Total number of students
+#define ROOM_CAPACITY  30          // Maximum capacity per exam room
+#define NUM_ROOMS ((NUM_STUDENTS+ROOM_CAPACITY - 1)/ROOM_CAPACITY) 
+                                   // Total rooms required (ceiling division)
 
+/* ------------ Data structures ------------ */
+
+// Represents a student
 typedef struct {
-    int id;
-    int room_id;
+    int id;        // Unique student ID
+    int room_id;   // Room assigned
 } Student;
 
+// Represents an exam room
 typedef struct {
-    int id;
-    int capacity;
+    int id;         // Room number
+    int capacity;   // Maximum allowed capacity
 } Room;
 
 /* ------------ Global data ------------ */
-static Student students[NUM_STUDENTS];
-static Room rooms[NUM_ROOMS];
-static int room_attendance[NUM_ROOMS];
+static Student students[NUM_STUDENTS];      // Array of all students
+static Room rooms[NUM_ROOMS];               // Array of rooms
+static int room_attendance[NUM_ROOMS];      // Tracks how many students are inside each room
 
-static sem_t exam_gate;
-static pthread_mutex_t room_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t end_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t end_cv = PTHREAD_COND_INITIALIZER;
-static int exam_over = 0;
+/* ------------ Synchronization primitives ------------ */
+static sem_t exam_gate;                     // Gate controlling student entry
+static pthread_mutex_t room_mutex = PTHREAD_MUTEX_INITIALIZER; // Protects room_attendance
+static pthread_mutex_t exam_mutex = PTHREAD_MUTEX_INITIALIZER; // Protects exam_over flag
+static pthread_cond_t end_bell = PTHREAD_COND_INITIALIZER;     // Signals exam end
+static int exam_over = 0;                   // Flag to signal exam completion
 
+// Struct for passing arguments to student threads
 typedef struct {
-    int sid;
+    int student_id;
     int room_id;
-} ThreadArg;
+} Thread_student;
 
 /* ------------ Student thread function ------------ */
+/*
+ * Each student waits for the exam gate to open (exam start),
+ * then enters the assigned room, waits until the exam is over,
+ * and finally leaves the room.
+ */
 void* student_thread(void *arg_void) {
-    ThreadArg *arg = (ThreadArg*)arg_void;
+    Thread_student *student = (Thread_student *)arg_void;
 
-    // Wait for exam start
+    // Wait until exam starts
     sem_wait(&exam_gate);
 
-    // Enter room safely
+    // Enter room (protected by mutex to update attendance safely)
     pthread_mutex_lock(&room_mutex);
-    room_attendance[arg->room_id]++;
-    int count = room_attendance[arg->room_id];
-    if (count > ROOM_CAPACITY)
-        fprintf(stderr, "ERROR: Room %d over capacity! count=%d (student %d)\n",arg->room_id + 1, count, arg->sid);
+    room_attendance[student->room_id]++;
+    int count = room_attendance[student->room_id];
 
-    printf("Student %3d entered Room %2d\n", arg->sid, arg->room_id + 1);
+    // Safety check: detect over-capacity
+    if (count > ROOM_CAPACITY)
+       printf("ERROR: Room %d over capacity! count=%d (student %d)\n",
+              student->room_id + 1, count, student->student_id);
+
+    printf("Student %3d entered Room %2d\n", 
+            student->student_id, student->room_id + 1);
     pthread_mutex_unlock(&room_mutex);
 
-    // Wait until exam ends
-    pthread_mutex_lock(&end_mutex);
+    // Wait until exam is declared over
+    pthread_mutex_lock(&exam_mutex);
     while (!exam_over)
-        pthread_cond_wait(&end_cv, &end_mutex);
-    pthread_mutex_unlock(&end_mutex);
+        pthread_cond_wait(&end_bell, &exam_mutex);
+    pthread_mutex_unlock(&exam_mutex);
 
-    printf("Student %3d left Room %2d\n", arg->sid, arg->room_id + 1);
-    free(arg);
+    // Student leaves room
+    printf("Student %3d left Room %2d\n", student->student_id, student->room_id + 1);
+    free(student);
     return NULL;
 }
 
-/* ------------ Child process: allocate students ------------ */
+/* ------------ Child process function ------------ */
+/*
+ * This function is run by the child process after fork().
+ * It assigns room IDs to all students (simple division-based allocation),
+ * then sends the assignments back to the parent via pipe().
+ */
 static void child_allocate_and_send(int write_fd) {
     int *room_ids = malloc(sizeof(int) * NUM_STUDENTS);
     if (!room_ids) _exit(1);
 
+    // Assign room IDs: students evenly distributed
     for (int i = 0; i < NUM_STUDENTS; i++)
-        room_ids[i] = i / ROOM_CAPACITY; // Assign room
+        room_ids[i] = i / ROOM_CAPACITY;
 
+    // Send room assignments to parent process
     write(write_fd, room_ids, sizeof(int) * NUM_STUDENTS);
+
     free(room_ids);
     close(write_fd);
-    _exit(0);
+    _exit(0);  // Exit child process
 }
 
 /* ------------ Main function ------------ */
-int main(void) {
+int main() {
     printf("Mock IELTS & GRE Exam Manager\n");
     printf("Students: %d | Rooms: %d | Capacity/Room: %d\n\n",
            NUM_STUDENTS, NUM_ROOMS, ROOM_CAPACITY);
 
-    int fds[2];
-    if (pipe(fds) == -1) { perror("pipe"); exit(1); }
-
-    pid_t pid = fork();
-    if (pid < 0) { perror("fork"); exit(1); }
-
-    if (pid == 0) {
-        close(fds[0]);
-        child_allocate_and_send(fds[1]);
+    /* --- Setup IPC using pipe and fork --- */
+    int readWrite[2];
+    if (pipe(readWrite) == -1) {
+        perror("pipe"); exit(1);
     }
 
-    // Parent: read allocation
-    close(fds[1]);
-    int room_ids_buf[NUM_STUDENTS];
-    read(fds[0], room_ids_buf, sizeof(int) * NUM_STUDENTS);
-    close(fds[0]);
-    wait(NULL);
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork"); exit(1);
+    }
 
-    // Initialize students & rooms
+    // Child: allocate and send room IDs
+    if (pid == 0) {
+        close(readWrite[0]); // Close unused read end
+        child_allocate_and_send(readWrite[1]);
+    }
+
+    // Parent: receive room assignments
+    close(readWrite[1]);
+    int room_ids_buf[NUM_STUDENTS];
+    read(readWrite[0], room_ids_buf, sizeof(int) * NUM_STUDENTS);
+    close(readWrite[0]);
+    wait(NULL);  // Wait for child to finish
+
+    /* --- Initialize rooms and students --- */
     for (int r = 0; r < NUM_ROOMS; r++) {
         rooms[r].id = r;
         rooms[r].capacity = ROOM_CAPACITY;
         room_attendance[r] = 0;
     }
     for (int i = 0; i < NUM_STUDENTS; i++) {
-        students[i].id = i + 1;
+        students[i].id = i + 1;              // Student IDs start from 1
         students[i].room_id = room_ids_buf[i];
     }
 
     sem_init(&exam_gate, 0, 0);
 
-    // Create student threads
-    pthread_t tids[NUM_STUDENTS];
+    /* --- Create student threads --- */
+    pthread_t thread_id[NUM_STUDENTS];
     for (int i = 0; i < NUM_STUDENTS; i++) {
-        ThreadArg *arg = malloc(sizeof(ThreadArg));
-        arg->sid = students[i].id;
+        Thread_student *arg = malloc(sizeof(Thread_student));
+        arg->student_id = students[i].id;
         arg->room_id = students[i].room_id;
-        pthread_create(&tids[i], NULL, student_thread, arg);
+        pthread_create(&thread_id[i], NULL, student_thread, arg);
     }
 
-    usleep(150 * 1000);
+    /* --- Simulate exam start --- */
+    usleep(150 * 1000); // Small delay before starting exam
     printf("\n=== EXAM STARTED ===\n");
-    for (int i = 0; i < NUM_STUDENTS; i++) sem_post(&exam_gate);
 
-    sleep(3); // simulate 3-hour exam
+    // Allow all students to enter
+    for (int i = 0; i < NUM_STUDENTS; i++) {
+        sem_post(&exam_gate);
+    }
 
-    // End exam
-    pthread_mutex_lock(&end_mutex);
+    sleep(3); // Simulated exam duration
+
+    /* --- Exam end signal --- */
+    pthread_mutex_lock(&exam_mutex);
     exam_over = 1;
-    pthread_cond_broadcast(&end_cv);
-    pthread_mutex_unlock(&end_mutex);
+    pthread_cond_broadcast(&end_bell);
+    pthread_mutex_unlock(&exam_mutex);
     printf("=== EXAM ENDED ===\n\n");
 
-    for (int i = 0; i < NUM_STUDENTS; i++) pthread_join(tids[i], NULL);
+    /* --- Wait for all students to finish --- */
+    for (int i = 0; i < NUM_STUDENTS; i++) {
+        pthread_join(thread_id[i], NULL);
+    }
+
     sem_destroy(&exam_gate);
 
-    // Summary
+    /* --- Print summary report --- */
     printf("---------- SUMMARY ----------\n");
     int total = 0;
     for (int r = 0; r < NUM_ROOMS; r++) {
@@ -156,6 +215,3 @@ int main(void) {
 
     return 0;
 }
-
-
-//need to note down the output
