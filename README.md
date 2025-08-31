@@ -32,14 +32,14 @@ It demonstrates **process synchronization, concurrency control, and IPC** throug
 
 ```bash
 # Clone the repo
-git clone https://github.com/your-username/mock-exam-manager.git
-cd mock-exam-manager
+git clone https://github.com/AbdullahSajid007/IELTS-and-GRE-exams-Problem-CSE325-project.git
+cd IELTS-and-GRE-exams-Problem-CSE325-project
 
 # Compile
-gcc exam_manager.c -o exam_manager -lpthread
+gcc source.c -o source
 
 # Run
-./exam_manager
+./source
 ```
 
 ---
